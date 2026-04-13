@@ -1,0 +1,1023 @@
+#!/usr/bin/env python3
+"""
+claude-code-saver — Auto-pick the Claude account with the most remaining quota.
+
+First-time setup:
+  claude-code-saver init        Run the setup wizard (recommended — handles everything)
+
+Daily use:
+  claude                   (after setup) launches claude with the best account
+  claude-code-saver status      Show all accounts and their current usage
+  claude-code-saver login       Log out, log in as a different account, save it
+  claude-code-saver doctor      Run diagnostics if something feels off
+
+Management:
+  claude-code-saver add         Save the currently logged-in Claude account
+  claude-code-saver remove <email>   Remove a saved account
+  claude-code-saver threshold <10-99>   Set the auto-switch threshold % (default: 80)
+  claude-code-saver uninstall   Remove everything (keychain entries, config, alias)
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ─── Constants ──────────────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".claude" / "claude-code-saver"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CLAUDE_JSON = Path.home() / ".claude.json"
+SERVICE = "com.claude-code-saver"
+OAUTH_SERVICE = "com.claude-code-saver.oauth"
+CLAUDE_SERVICE = "Claude Code-credentials"
+USAGE_API = "https://api.anthropic.com/api/oauth/usage"
+DEFAULT_THRESHOLD = 80
+OS_USER = os.environ.get("USER") or subprocess.check_output(["whoami"]).decode().strip()
+
+# ─── Colors ────────────────────────────────────────────────────────────────
+
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_BLUE = "\033[34m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_RESET = "\033[0m"
+
+
+def c(color, text):
+    return f"{color}{text}{C_RESET}" if sys.stdout.isatty() else text
+
+
+def say_ok(msg):
+    print(c(C_GREEN, "  ✓") + " " + msg)
+
+
+def say_fail(msg):
+    print(c(C_RED, "  ✗") + " " + msg)
+
+
+def say_warn(msg):
+    print(c(C_YELLOW, "  ⚠") + " " + msg)
+
+
+def say_step(msg):
+    print(c(C_BLUE, "→") + " " + c(C_BOLD, msg))
+
+
+def ask(prompt, default="y"):
+    """Prompt user with y/n question, returns True/False."""
+    suffix = " [Y/n]: " if default.lower() == "y" else " [y/N]: "
+    try:
+        reply = input(prompt + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not reply:
+        reply = default.lower()
+    return reply in ("y", "yes")
+
+# ─── Claude CLI discovery ──────────────────────────────────────────────────
+
+def find_claude_bin():
+    """Find the claude binary. Cached in config after first detection."""
+    cfg = load_config()
+    cached = cfg.get("claude_bin")
+    if cached and Path(cached).exists():
+        return cached
+
+    # Try PATH first
+    found = shutil.which("claude")
+    if found and not found.startswith(str(CONFIG_DIR)):  # not our wrapper
+        return found
+
+    # Fall back to common install locations
+    home = str(Path.home())
+    candidates = [
+        f"{home}/.local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        f"{home}/.npm-global/bin/claude",
+        f"{home}/.claude/local/claude",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+# ─── Keychain ───────────────────────────────────────────────────────────────
+
+def kc_read(service, account):
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def kc_write(service, account, password):
+    # delete first, then add — `-U` flag can be flaky with long passwords
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True, timeout=5,
+    )
+    subprocess.run(
+        ["security", "add-generic-password", "-s", service, "-a", account, "-w", password],
+        capture_output=True, timeout=5,
+    )
+
+
+def kc_delete(service, account):
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True, timeout=5,
+    )
+
+# ─── Token helpers ──────────────────────────────────────────────────────────
+
+def read_live_token():
+    return kc_read(CLAUDE_SERVICE, OS_USER)
+
+
+def write_live_token(token_json):
+    kc_write(CLAUDE_SERVICE, OS_USER, token_json)
+
+
+def extract_access_token(token_json):
+    try:
+        return json.loads(token_json)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+def fingerprint(token_json):
+    """Last 8 chars of accessToken — fast identity check."""
+    try:
+        at = json.loads(token_json)["claudeAiOauth"]["accessToken"]
+        return at[-8:] if len(at) >= 8 else at
+    except Exception:
+        return ""
+
+# ─── oauthAccount helpers (the ~/.claude.json identity) ─────────────────────
+
+def read_live_oauth_account():
+    """Read the oauthAccount from ~/.claude.json."""
+    try:
+        data = json.loads(CLAUDE_JSON.read_text())
+        return data.get("oauthAccount")
+    except Exception:
+        return None
+
+
+def write_live_oauth_account(oauth_account):
+    """Write oauthAccount into ~/.claude.json (preserves other fields)."""
+    try:
+        data = json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
+        data["oauthAccount"] = oauth_account
+        CLAUDE_JSON.write_text(json.dumps(data, indent=2))
+        return True
+    except Exception:
+        return False
+
+# ─── Usage API ──────────────────────────────────────────────────────────────
+
+def fetch_usage(access_token):
+    """Returns dict with usage data, or {"_error": "reason"} on failure."""
+    req = urllib.request.Request(
+        USAGE_API,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"_error": "expired"}
+        return {"_error": f"http_{e.code}"}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def session_util(usage):
+    """Extract five_hour utilization as percentage (0-100) from usage response."""
+    if not usage or "_error" in usage:
+        return None
+    return usage.get("five_hour", {}).get("utilization")
+
+
+def format_reset(usage):
+    """Human-readable time until session reset."""
+    try:
+        resets = usage.get("five_hour", {}).get("resets_at", "")
+        if not resets:
+            return ""
+        rt = datetime.fromisoformat(resets.replace("Z", "+00:00"))
+        secs = (rt - datetime.now(timezone.utc)).total_seconds()
+        if secs <= 0:
+            return "resets now"
+        h, m = int(secs) // 3600, (int(secs) % 3600) // 60
+        return f"resets in {h}h{m:02d}m" if h else f"resets in {m}m"
+    except Exception:
+        return ""
+
+# ─── Config ─────────────────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {"accounts": [], "threshold": DEFAULT_THRESHOLD, "active_id": None}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+# ─── CLI identity ───────────────────────────────────────────────────────────
+
+def get_auth_status():
+    """Run `claude auth status` and parse email + subscription."""
+    claude = find_claude_bin()
+    if not claude:
+        return None, None
+    try:
+        r = subprocess.run(
+            [claude, "auth", "status"],
+            capture_output=True, text=True, timeout=15,
+        )
+        output = r.stdout + r.stderr
+        email = None
+        sub = None
+        for line in output.splitlines():
+            if not email:
+                m = re.search(r"[\w.\-+]+@[\w.\-]+\.\w+", line)
+                if m:
+                    email = m.group(0)
+            if "pro" in line.lower():
+                sub = "pro"
+            elif "max" in line.lower() and "20" in line:
+                sub = "max_20x"
+            elif "max" in line.lower():
+                sub = "max_5x"
+            elif "team" in line.lower():
+                sub = "teams"
+        return email, sub
+    except Exception:
+        return None, None
+
+# ─── Commands ───────────────────────────────────────────────────────────────
+
+def cmd_add():
+    cfg = load_config()
+
+    token_json = read_live_token()
+    if not token_json:
+        print("No Claude token in Keychain. Run 'claude auth login' first.")
+        return 1
+
+    if not extract_access_token(token_json):
+        print("Could not parse token. Is Claude logged in?")
+        return 1
+
+    # Read oauthAccount from ~/.claude.json
+    oauth_account = read_live_oauth_account()
+    if oauth_account:
+        email = oauth_account.get("emailAddress")
+        sub = None
+    else:
+        email = None
+        sub = None
+
+    # Fallback to CLI if oauthAccount missing
+    if not email:
+        print("Reading account identity...")
+        email, sub = get_auth_status()
+
+    if not email:
+        print("Could not determine account email. Check 'claude auth status'.")
+        return 1
+
+    # Detect subscription from token or oauthAccount
+    if not sub:
+        try:
+            tok_data = json.loads(token_json)
+            sub = tok_data.get("claudeAiOauth", {}).get("subscriptionType")
+        except Exception:
+            pass
+    # Also try fetching usage to check extra_usage details
+    if not sub and oauth_account:
+        billing = oauth_account.get("billingType", "")
+        if "subscription" in billing:
+            sub = "pro"  # will be refined by usage API
+
+    # Update existing or add new
+    for a in cfg["accounts"]:
+        if a["email"] == email:
+            kc_write(SERVICE, a["id"], token_json)
+            if oauth_account:
+                kc_write(OAUTH_SERVICE, a["id"], json.dumps(oauth_account))
+            a["subscription"] = sub or a.get("subscription", "unknown")
+            a["updated_at"] = datetime.now().isoformat()
+            save_config(cfg)
+            print(f"Updated: {email} ({sub})")
+            return 0
+
+    aid = str(uuid.uuid4())
+    kc_write(SERVICE, aid, token_json)
+    if oauth_account:
+        kc_write(OAUTH_SERVICE, aid, json.dumps(oauth_account))
+
+    cfg["accounts"].append({
+        "id": aid,
+        "email": email,
+        "subscription": sub or "unknown",
+        "added_at": datetime.now().isoformat(),
+    })
+    cfg["active_id"] = aid
+    save_config(cfg)
+    print(f"Saved: {email} ({sub})")
+    print(f"Total accounts: {len(cfg['accounts'])}")
+    return 0
+
+
+def cmd_remove(email):
+    cfg = load_config()
+    found = [a for a in cfg["accounts"] if a["email"] == email]
+    if not found:
+        print(f"Account '{email}' not found.")
+        return 1
+    kc_delete(SERVICE, found[0]["id"])
+    kc_delete(OAUTH_SERVICE, found[0]["id"])
+    cfg["accounts"] = [a for a in cfg["accounts"] if a["email"] != email]
+    if cfg.get("active_id") == found[0]["id"]:
+        cfg["active_id"] = cfg["accounts"][0]["id"] if cfg["accounts"] else None
+    save_config(cfg)
+    print(f"Removed: {email}")
+    return 0
+
+
+def cmd_status():
+    cfg = load_config()
+    if not cfg["accounts"]:
+        print("No accounts saved. Run 'claude-code-saver add' after logging in.")
+        return 0
+
+    live_token = read_live_token()
+    live_fp = fingerprint(live_token) if live_token else None
+
+    print()
+    print(f"  {'Account':<35} {'Plan':<10} {'Session':<12} {'Weekly':<12} {'Status'}")
+    print(f"  {'─'*35} {'─'*10} {'─'*12} {'─'*12} {'─'*10}")
+
+    for acct in cfg["accounts"]:
+        tok = kc_read(SERVICE, acct["id"])
+        email = acct["email"]
+        sub = acct.get("subscription", "?")
+
+        if not tok:
+            print(f"  {email:<35} {sub:<10} {'—':<12} {'—':<12} no token")
+            continue
+
+        at = extract_access_token(tok)
+        if not at:
+            print(f"  {email:<35} {sub:<10} {'—':<12} {'—':<12} bad token")
+            continue
+
+        is_active = live_fp and fingerprint(tok) == live_fp
+        usage = fetch_usage(at)
+
+        if usage and "_error" not in usage:
+            s = usage.get("five_hour", {}).get("utilization", 0)
+            w = usage.get("seven_day", {}).get("utilization", 0)
+            s_str = f"{s:.0f}%"
+            w_str = f"{w:.0f}%"
+            reset = format_reset(usage)
+            mark = "ACTIVE" if is_active else ""
+            print(f"  {email:<35} {sub:<10} {s_str:<12} {w_str:<12} {mark}")
+            if reset and is_active:
+                print(f"  {'':35} {'':10} {reset}")
+        elif usage and usage.get("_error") == "expired":
+            mark = "ACTIVE" if is_active else ""
+            print(f"  {email:<35} {sub:<10} {'expired':<12} {'—':<12} {mark}")
+        else:
+            print(f"  {email:<35} {sub:<10} {'error':<12} {'—':<12}")
+
+    t = cfg.get("threshold", DEFAULT_THRESHOLD)
+    print(f"\n  Auto-switch threshold: {t:.0f}%")
+    print()
+    return 0
+
+
+def worst_util(usage):
+    """Return the highest utilization across session AND weekly windows."""
+    if not usage or "_error" in usage:
+        return None
+    session = usage.get("five_hour", {}).get("utilization")
+    weekly = usage.get("seven_day", {}).get("utilization")
+    vals = [v for v in (session, weekly) if v is not None]
+    return max(vals) if vals else None
+
+
+def usage_summary(usage):
+    """Return a short string like 'session 20% / weekly 89%'."""
+    if not usage or "_error" in usage:
+        return "unknown"
+    s = usage.get("five_hour", {}).get("utilization")
+    w = usage.get("seven_day", {}).get("utilization")
+    parts = []
+    if s is not None:
+        parts.append(f"session {s:.0f}%")
+    if w is not None:
+        parts.append(f"weekly {w:.0f}%")
+    return " / ".join(parts) if parts else "unknown"
+
+
+def cmd_launch(args):
+    cfg = load_config()
+    threshold = cfg.get("threshold", DEFAULT_THRESHOLD)
+
+    # No accounts saved — pass through
+    if not cfg["accounts"]:
+        launch_claude(args)
+
+    live_token = read_live_token()
+    if not live_token:
+        launch_claude(args)
+
+    live_access = extract_access_token(live_token)
+    live_fp = fingerprint(live_token)
+
+    # ── Fast path: check current account ────────────────────────────────
+    need_switch = False
+    current_usage = None
+    current_worst = None
+
+    if live_access:
+        current_usage = fetch_usage(live_access)
+        current_worst = worst_util(current_usage)
+        if current_worst is not None:
+            if current_worst < threshold:
+                # Both session AND weekly are under threshold — launch immediately
+                launch_claude(args)
+            need_switch = True
+        elif current_usage and current_usage.get("_error") == "expired":
+            need_switch = True
+        else:
+            # Can't reach API — don't block the user
+            launch_claude(args)
+
+    if not need_switch:
+        launch_claude(args)
+
+    # ── Slow path: check all saved accounts in parallel ─────────────────
+    # First, back up current live token + oauthAccount to the active slot
+    active_id = cfg.get("active_id")
+    if active_id:
+        kc_write(SERVICE, active_id, live_token)
+        live_oauth = read_live_oauth_account()
+        if live_oauth:
+            kc_write(OAUTH_SERVICE, active_id, json.dumps(live_oauth))
+
+    # Find current account email for display
+    current_email = "current"
+    for a in cfg["accounts"]:
+        if a["id"] == active_id:
+            current_email = a["email"]
+            break
+
+    if current_worst is not None:
+        print(f"\033[33m⚡ {current_email}: {usage_summary(current_usage)}\033[0m")
+    else:
+        print(f"\033[33m⚡ {current_email}: token expired\033[0m")
+
+    def check_account(acct):
+        tok = kc_read(SERVICE, acct["id"])
+        if not tok:
+            return None
+        # Skip if this is the same as the live token
+        if fingerprint(tok) == live_fp:
+            return None
+        at = extract_access_token(tok)
+        if not at:
+            return None
+        u = fetch_usage(at)
+        w = worst_util(u)
+        if w is not None:
+            return (acct, tok, w, u)
+        return None
+
+    candidates = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(check_account, a): a for a in cfg["accounts"]}
+        for f in as_completed(futures):
+            r = f.result()
+            if r:
+                candidates.append(r)
+
+    if not candidates:
+        print("\033[33m  No other accounts available — launching as-is\033[0m")
+        launch_claude(args)
+
+    # Pick the account with the lowest worst-case utilization
+    candidates.sort(key=lambda x: x[2])
+    best_acct, best_tok, best_worst, best_usage = candidates[0]
+
+    reset_str = format_reset(best_usage)
+    reset_part = f" ({reset_str})" if reset_str else ""
+    print(f"\033[32m  → {best_acct['email']}: {usage_summary(best_usage)}{reset_part}\033[0m")
+
+    # Swap token + oauthAccount and update config
+    write_live_token(best_tok)
+    best_oauth_json = kc_read(OAUTH_SERVICE, best_acct["id"])
+    if best_oauth_json:
+        try:
+            write_live_oauth_account(json.loads(best_oauth_json))
+        except Exception:
+            pass
+    cfg["active_id"] = best_acct["id"]
+    save_config(cfg)
+
+    launch_claude(args)
+
+
+def cmd_threshold(val):
+    cfg = load_config()
+    try:
+        t = float(val)
+        if t < 1:
+            t = t * 100  # handle 0.8 → 80
+        t = max(10, min(99, t))
+        cfg["threshold"] = t
+        save_config(cfg)
+        print(f"Threshold set to {t:.0f}%")
+        return 0
+    except ValueError:
+        print("Usage: claude-code-saver threshold <10-99>")
+        return 1
+
+
+def launch_claude(args):
+    """Replace this process with claude."""
+    claude = find_claude_bin()
+    if not claude:
+        print(c(C_RED, "Claude CLI not found. Install it first: https://claude.com/claude-code"))
+        sys.exit(1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvp(claude, [claude] + args)
+
+# ─── Shell integration ─────────────────────────────────────────────────────
+
+ALIAS_MARKER = "# claude-code-saver auto-switch (managed — do not edit this block)"
+ALIAS_END = "# end claude-code-saver"
+SELF_PATH = str(Path(__file__).resolve()) if __file__ else "~/.claude/claude-code-saver/claude-code-saver"
+
+
+def detect_shell_rc():
+    """Return the user's shell rc file path, creating context for install."""
+    shell = os.environ.get("SHELL", "")
+    home = Path.home()
+    if "zsh" in shell:
+        rc = home / ".zshrc"
+    elif "bash" in shell:
+        # macOS uses .bash_profile for login shells; Linux uses .bashrc
+        if sys.platform == "darwin":
+            rc = home / ".bash_profile"
+        else:
+            rc = home / ".bashrc"
+    elif "fish" in shell:
+        rc = home / ".config" / "fish" / "config.fish"
+    else:
+        rc = home / ".profile"
+    return rc, shell
+
+
+def alias_installed(rc_path):
+    """Check if a claude alias pointing to our script exists in the rc file."""
+    if not rc_path.exists():
+        return False
+    try:
+        content = rc_path.read_text()
+        # Either our marked block OR any alias that points to our script
+        if ALIAS_MARKER in content:
+            return True
+        # Look for: alias claude='...claude-code-saver...launch'
+        pattern = r"alias\s+claude\s*=.*claude-code-saver.*launch"
+        return bool(re.search(pattern, content))
+    except Exception:
+        return False
+
+
+def install_alias(rc_path):
+    """Append the claude-code-saver alias block to the shell rc, idempotently."""
+    if alias_installed(rc_path):
+        return "already_installed"
+
+    rc_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # fish shell uses different alias syntax
+    if "fish" in str(rc_path):
+        block = f"""
+{ALIAS_MARKER}
+alias claude-code-saver='{SELF_PATH}'
+alias claude='{SELF_PATH} launch'
+{ALIAS_END}
+"""
+    else:
+        block = f"""
+{ALIAS_MARKER}
+alias claude-code-saver='{SELF_PATH}'
+alias claude='{SELF_PATH} launch'
+{ALIAS_END}
+"""
+
+    with open(rc_path, "a") as f:
+        f.write(block)
+    return "installed"
+
+# ─── Doctor (preflight diagnostics) ────────────────────────────────────────
+
+def cmd_doctor():
+    """Run diagnostics and print a health report."""
+    print()
+    print(c(C_BOLD, "  claude-code-saver doctor"))
+    print("  " + "─" * 40)
+    all_ok = True
+
+    # 1. Python version
+    if sys.version_info >= (3, 7):
+        say_ok(f"Python {sys.version_info.major}.{sys.version_info.minor}")
+    else:
+        say_fail(f"Python {sys.version_info.major}.{sys.version_info.minor} — need 3.7+")
+        all_ok = False
+
+    # 2. macOS (security CLI)
+    if sys.platform != "darwin":
+        say_fail(f"Platform: {sys.platform} — only macOS is supported (uses Keychain)")
+        all_ok = False
+    else:
+        say_ok("Platform: macOS")
+
+    # 3. security CLI available
+    if shutil.which("security"):
+        say_ok("Keychain access (security CLI)")
+    else:
+        say_fail("security CLI not found — something is very wrong with macOS")
+        all_ok = False
+
+    # 4. Claude CLI
+    claude = find_claude_bin()
+    if claude:
+        try:
+            v = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=5)
+            say_ok(f"Claude CLI: {claude} ({v.stdout.strip()})")
+        except Exception:
+            say_ok(f"Claude CLI: {claude}")
+    else:
+        say_fail("Claude CLI not found in PATH or common locations")
+        print("    Install it: https://claude.com/claude-code")
+        all_ok = False
+
+    # 5. Currently logged in?
+    live = read_live_token()
+    if live:
+        at = extract_access_token(live)
+        if at:
+            oauth = read_live_oauth_account()
+            email = oauth.get("emailAddress") if oauth else "unknown"
+            say_ok(f"Logged in as: {email}")
+        else:
+            say_warn("Token found but can't parse it")
+    else:
+        say_warn("Not currently logged in — run 'claude auth login' first")
+        all_ok = False
+
+    # 6. Saved accounts
+    cfg = load_config()
+    count = len(cfg.get("accounts", []))
+    if count == 0:
+        say_warn("No accounts saved yet — run 'claude-code-saver init'")
+    else:
+        say_ok(f"Saved accounts: {count}")
+
+    # 7. Shell alias
+    rc, shell = detect_shell_rc()
+    if alias_installed(rc):
+        say_ok(f"Shell alias installed in {rc}")
+    else:
+        say_warn(f"Shell alias NOT installed — run 'claude-code-saver init' or add manually to {rc}")
+
+    # 8. Network (usage API reachable — we expect 401 without a token)
+    try:
+        urllib.request.urlopen(USAGE_API, timeout=3)
+        say_ok("Network: usage API reachable")
+    except urllib.error.HTTPError as e:
+        # 401/403 means we hit the endpoint — auth is the issue, not network
+        if e.code in (401, 403):
+            say_ok("Network: usage API reachable")
+        else:
+            say_warn(f"Usage API returned HTTP {e.code}")
+    except Exception as e:
+        say_warn(f"Cannot reach usage API: {e}")
+
+    print()
+    if all_ok and count > 0 and alias_installed(rc):
+        print("  " + c(C_GREEN, "All systems go. Use `claude` normally."))
+    else:
+        print("  " + c(C_YELLOW, "Run `claude-code-saver init` to finish setup."))
+    print()
+    return 0 if all_ok else 1
+
+# ─── Login (combined logout + login + save) ────────────────────────────────
+
+def cmd_login():
+    """Log out, log in as a new account, save it. Combined flow."""
+    claude = find_claude_bin()
+    if not claude:
+        print(c(C_RED, "Claude CLI not found. Install it first: https://claude.com/claude-code"))
+        return 1
+
+    # Show current state
+    cur_oauth = read_live_oauth_account()
+    cur_email = cur_oauth.get("emailAddress") if cur_oauth else None
+
+    if cur_email:
+        print(f"Currently logged in as: {c(C_BOLD, cur_email)}")
+        # Before logging out, back up the current account if it's saved
+        cfg = load_config()
+        for a in cfg["accounts"]:
+            if a["email"] == cur_email:
+                live_token = read_live_token()
+                if live_token:
+                    kc_write(SERVICE, a["id"], live_token)
+                if cur_oauth:
+                    kc_write(OAUTH_SERVICE, a["id"], json.dumps(cur_oauth))
+                say_ok(f"Backed up {cur_email} token")
+                break
+
+    # Step 1: Log out of Claude CLI
+    print()
+    say_step("Logging out of Claude CLI...")
+    os.system(f'"{claude}" auth logout')
+    say_ok("Logged out of CLI")
+
+    # Step 2: Have the user sort out the browser themselves
+    print()
+    print("  " + "─" * 50)
+    print(c(C_BOLD, "  Now do this in your browser:"))
+    print()
+    print(f"    1. Go to {c(C_BOLD, 'claude.ai')} and log out")
+    print(f"       (Profile icon → Sign out)")
+    print()
+    print(f"    2. Log back in with the account you want to add")
+    print()
+    print(f"    3. Come back here and press Enter")
+    print("  " + "─" * 50)
+    print()
+
+    try:
+        input(c(C_YELLOW, "  Press Enter when you're logged into the new account in the browser... "))
+    except (EOFError, KeyboardInterrupt):
+        print(c(C_YELLOW, "\n  Cancelled."))
+        return 1
+
+    # Step 3: Now run claude auth login — browser already has the right account
+    print()
+    say_step("Connecting Claude CLI to your browser session...")
+    exit_code = os.system(f'"{claude}" auth login')
+
+    if exit_code != 0:
+        print()
+        say_fail("Login did not complete.")
+        print(c(C_DIM, "  Try running 'claude auth login' directly, then 'claude-code-saver add'."))
+        return 1
+
+    import time
+    time.sleep(1)
+
+    print()
+    say_step("Saving account...")
+    return cmd_add()
+
+# ─── Init (first-time wizard) ──────────────────────────────────────────────
+
+def cmd_init():
+    """First-time setup wizard."""
+    print()
+    print(c(C_BOLD, "  claude-code-saver setup wizard"))
+    print("  " + "─" * 40)
+    print()
+
+    # 1. Check Claude CLI
+    claude = find_claude_bin()
+    if not claude:
+        say_fail("Claude CLI not found.")
+        print()
+        print("  Install it first:")
+        print(c(C_DIM, "    https://claude.com/claude-code"))
+        print()
+        print("  Then re-run: " + c(C_BOLD, "claude-code-saver init"))
+        return 1
+    say_ok(f"Claude CLI found at {claude}")
+
+    # 2. Check if logged in
+    live = read_live_token()
+    if not live:
+        say_warn("You're not logged in to Claude yet.")
+        print()
+        if ask("  Start login flow now?", "y"):
+            exit_code = os.system(f'"{claude}" auth login')
+            if exit_code != 0:
+                say_fail("Login failed. Run 'claude auth login' directly, then re-run init.")
+                return 1
+        else:
+            print()
+            print("  Log in with: " + c(C_BOLD, "claude auth login"))
+            print("  Then re-run: " + c(C_BOLD, "claude-code-saver init"))
+            return 1
+
+    # 3. Save current account
+    cur_oauth = read_live_oauth_account()
+    cur_email = cur_oauth.get("emailAddress") if cur_oauth else None
+
+    cfg = load_config()
+    already_saved = any(a["email"] == cur_email for a in cfg["accounts"])
+
+    if cur_email and not already_saved:
+        print()
+        print(f"  Current Claude account: {c(C_BOLD, cur_email)}")
+        if ask("  Save this account?", "y"):
+            cmd_add()
+    elif cur_email and already_saved:
+        say_ok(f"{cur_email} is already saved")
+
+    # 4. Offer to add more
+    while True:
+        cfg = load_config()
+        count = len(cfg["accounts"])
+        print()
+        print(f"  You now have {c(C_BOLD, str(count))} account(s) saved.")
+
+        if not ask("  Add another account?", "y" if count < 2 else "n"):
+            break
+
+        print()
+        print(c(C_DIM, "  You'll need a SECOND Anthropic account (different email)"))
+        print(c(C_DIM, "  with its own Pro/Max subscription to stack usage limits."))
+        print()
+
+        if not ask("  Ready to log out and log in as a different account?", "y"):
+            print("  Skipping. You can add more later with: " + c(C_BOLD, "claude-code-saver login"))
+            break
+
+        cmd_login()
+
+    # 5. Install shell alias
+    print()
+    rc, shell = detect_shell_rc()
+    if alias_installed(rc):
+        say_ok(f"Shell alias already installed in {rc}")
+    else:
+        print(f"  Installing alias into {c(C_BOLD, str(rc))} (shell: {shell})")
+        if ask("  OK to edit your shell rc file?", "y"):
+            result = install_alias(rc)
+            if result == "installed":
+                say_ok(f"Added alias to {rc}")
+            else:
+                say_ok("Alias already there")
+        else:
+            print(c(C_YELLOW, "  Skipped — you'll need to add this manually:"))
+            print(f"    alias claude-code-saver='{SELF_PATH}'")
+            print(f"    alias claude='{SELF_PATH} launch'")
+
+    # 6. Final summary
+    print()
+    print("  " + "─" * 40)
+    print(c(C_GREEN, c(C_BOLD, "  ✓ Setup complete!")))
+    print()
+    print("  Next steps:")
+    print(f"    1. Reload your shell:  {c(C_BOLD, 'source ' + str(rc))}")
+    print(f"       (or open a new terminal)")
+    print(f"    2. Use claude normally: {c(C_BOLD, 'claude')}")
+    print()
+    print(f"  Run {c(C_BOLD, 'claude-code-saver status')} anytime to see account quotas.")
+    print()
+    return 0
+
+# ─── Uninstall ─────────────────────────────────────────────────────────────
+
+def cmd_uninstall():
+    """Remove claude-code-saver: delete keychain entries, config, and shell alias."""
+    print()
+    print(c(C_BOLD, "  claude-code-saver uninstall"))
+    print("  " + "─" * 40)
+    print()
+    print("  This will:")
+    print("    • Remove all saved account backups from Keychain")
+    print("    • Delete the config file")
+    print("    • Remove the shell alias")
+    print("    • Leave the script file and your live Claude login alone")
+    print()
+    if not ask("  Continue?", "n"):
+        print("  Cancelled.")
+        return 0
+
+    # Remove keychain entries
+    cfg = load_config()
+    for a in cfg["accounts"]:
+        kc_delete(SERVICE, a["id"])
+        kc_delete(OAUTH_SERVICE, a["id"])
+    say_ok(f"Removed {len(cfg['accounts'])} account backups from Keychain")
+
+    # Delete config
+    if CONFIG_FILE.exists():
+        CONFIG_FILE.unlink()
+        say_ok(f"Deleted {CONFIG_FILE}")
+
+    # Remove alias
+    rc, _ = detect_shell_rc()
+    if rc.exists() and alias_installed(rc):
+        content = rc.read_text()
+        lines = content.split("\n")
+        new_lines = []
+        skip = False
+        for line in lines:
+            if ALIAS_MARKER in line:
+                skip = True
+                continue
+            if ALIAS_END in line:
+                skip = False
+                continue
+            if not skip:
+                new_lines.append(line)
+        rc.write_text("\n".join(new_lines))
+        say_ok(f"Removed alias from {rc}")
+
+    print()
+    print(c(C_GREEN, "  Uninstalled."))
+    print(c(C_DIM, f"  To delete the script too: rm -rf {CONFIG_DIR}"))
+    print()
+    return 0
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    # Smart default: no args → first-run does init, otherwise shows status
+    if len(sys.argv) < 2:
+        cfg = load_config()
+        if not cfg.get("accounts"):
+            # First run — no accounts saved yet
+            return cmd_init()
+        # Already set up — show status
+        return cmd_status()
+
+    cmd = sys.argv[1]
+
+    if cmd == "init":
+        return cmd_init()
+    elif cmd == "add":
+        return cmd_add()
+    elif cmd == "login":
+        return cmd_login()
+    elif cmd == "status":
+        return cmd_status()
+    elif cmd == "doctor":
+        return cmd_doctor()
+    elif cmd == "uninstall":
+        return cmd_uninstall()
+    elif cmd == "remove" and len(sys.argv) >= 3:
+        return cmd_remove(sys.argv[2])
+    elif cmd == "launch":
+        return cmd_launch(sys.argv[2:])
+    elif cmd == "threshold" and len(sys.argv) >= 3:
+        return cmd_threshold(sys.argv[2])
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    else:
+        # Unknown command — show help
+        print(c(C_RED, f"Unknown command: {cmd}"))
+        print()
+        print(__doc__.strip())
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
