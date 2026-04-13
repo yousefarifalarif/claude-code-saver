@@ -90,4 +90,11 @@ ok "Made executable"
 
 step "Launching setup wizard"
 printf "\n"
-exec "$INSTALL_DIR/claude-code-saver" init
+
+# When run via `curl | bash`, stdin is the pipe from curl — not the terminal.
+# Redirect stdin from /dev/tty so the wizard's prompts actually read user input.
+if [[ -r /dev/tty ]]; then
+    exec "$INSTALL_DIR/claude-code-saver" init < /dev/tty
+else
+    exec "$INSTALL_DIR/claude-code-saver" init
+fi

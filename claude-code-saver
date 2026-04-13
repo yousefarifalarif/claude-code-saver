@@ -74,6 +74,21 @@ def say_step(msg):
     print(c(C_BLUE, "→") + " " + c(C_BOLD, msg))
 
 
+def ensure_tty_stdin():
+    """If stdin is not a TTY (e.g. `curl | bash`), redirect fd 0 to /dev/tty.
+    Call once at the start of interactive commands. Idempotent + safe to fail.
+    """
+    if sys.stdin.isatty():
+        return
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDONLY)
+        os.dup2(tty_fd, 0)
+        os.close(tty_fd)
+        sys.stdin = os.fdopen(0, "r")
+    except OSError:
+        pass  # Truly non-interactive (CI, daemon) — ask() will fall back to defaults
+
+
 def ask(prompt, default="y"):
     """Prompt user with y/n question, returns True/False."""
     suffix = " [Y/n]: " if default.lower() == "y" else " [y/N]: "
@@ -747,6 +762,7 @@ def cmd_doctor():
 
 def cmd_login():
     """Log out, log in as a new account, save it. Combined flow."""
+    ensure_tty_stdin()
     claude = find_claude_bin()
     if not claude:
         print(c(C_RED, "Claude CLI not found. Install it first: https://claude.com/claude-code"))
@@ -818,6 +834,7 @@ def cmd_login():
 
 def cmd_init():
     """First-time setup wizard."""
+    ensure_tty_stdin()  # critical when run via `curl | bash`
     print()
     print(c(C_BOLD, "  claude-code-saver setup wizard"))
     print("  " + "─" * 40)
