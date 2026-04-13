@@ -297,6 +297,61 @@ def get_auth_status():
 
 # ─── Commands ───────────────────────────────────────────────────────────────
 
+def account_identity(oauth_account):
+    """Extract (email, org_uuid, org_name, billing_type) from oauthAccount JSON.
+    org_uuid is the authoritative per-account identifier — two accounts with
+    the same email but different org_uuid are different accounts (e.g. personal
+    Pro vs. company Team)."""
+    if not oauth_account:
+        return None, None, None, None
+    return (
+        oauth_account.get("emailAddress"),
+        oauth_account.get("organizationUuid"),
+        oauth_account.get("organizationName"),
+        oauth_account.get("billingType"),
+    )
+
+
+def find_account(cfg, email, org_uuid):
+    """Locate an existing account by (email, org_uuid).
+    Falls back to email-only match for legacy configs that lack org_uuid."""
+    if not email:
+        return None
+    # Strict match on email + org_uuid
+    if org_uuid:
+        for a in cfg["accounts"]:
+            if a["email"] == email and a.get("organization_uuid") == org_uuid:
+                return a
+    # Legacy match: same email, no org_uuid stored (pre-multi-org version)
+    for a in cfg["accounts"]:
+        if a["email"] == email and not a.get("organization_uuid"):
+            return a
+    return None
+
+
+def format_account_label(account, disambiguate=False):
+    """Human-friendly account label.
+    disambiguate=True forces org suffix even when unambiguous by email alone."""
+    email = account["email"]
+    org = (account.get("organization_name") or "").strip()
+    sub = account.get("subscription", "?")
+
+    # Anthropic's default personal org name is "<email>'s Organization" — hide it
+    is_default_org = org.lower().startswith(email.lower())
+
+    if (disambiguate or not is_default_org) and org:
+        return f"{email} — {org} ({sub})"
+    return f"{email} ({sub})"
+
+
+def duplicate_emails(cfg):
+    """Return set of emails that appear on 2+ accounts."""
+    counts = {}
+    for a in cfg["accounts"]:
+        counts[a["email"]] = counts.get(a["email"], 0) + 1
+    return {e for e, n in counts.items() if n > 1}
+
+
 def cmd_add():
     cfg = load_config()
 
@@ -309,16 +364,12 @@ def cmd_add():
         print("Could not parse token. Is Claude logged in?")
         return 1
 
-    # Read oauthAccount from ~/.claude.json
+    # Read oauthAccount from ~/.claude.json — the source of truth for identity
     oauth_account = read_live_oauth_account()
-    if oauth_account:
-        email = oauth_account.get("emailAddress")
-        sub = None
-    else:
-        email = None
-        sub = None
+    email, org_uuid, org_name, billing = account_identity(oauth_account)
+    sub = None
 
-    # Fallback to CLI if oauthAccount missing
+    # Fallback to CLI if oauthAccount missing or incomplete
     if not email:
         print("Reading account identity...")
         email, sub = get_auth_status()
@@ -327,55 +378,76 @@ def cmd_add():
         print("Could not determine account email. Check 'claude auth status'.")
         return 1
 
-    # Detect subscription from token or oauthAccount
+    # Detect subscription from token, oauthAccount, or CLI
     if not sub:
         try:
             tok_data = json.loads(token_json)
             sub = tok_data.get("claudeAiOauth", {}).get("subscriptionType")
         except Exception:
             pass
-    # Also try fetching usage to check extra_usage details
-    if not sub and oauth_account:
-        billing = oauth_account.get("billingType", "")
-        if "subscription" in billing:
-            sub = "pro"  # will be refined by usage API
+    if not sub and billing:
+        if "team" in billing.lower() or "enterprise" in billing.lower():
+            sub = "team"
+        elif "subscription" in billing.lower():
+            sub = "pro"
 
-    # Update existing or add new
-    for a in cfg["accounts"]:
-        if a["email"] == email:
-            kc_write(SERVICE, a["id"], token_json)
-            if oauth_account:
-                kc_write(OAUTH_SERVICE, a["id"], json.dumps(oauth_account))
-            a["subscription"] = sub or a.get("subscription", "unknown")
-            a["updated_at"] = datetime.now().isoformat()
-            save_config(cfg)
-            print(f"Updated: {email} ({sub})")
-            return 0
+    # Match on (email, org_uuid) — handles same-email-different-org case
+    existing = find_account(cfg, email, org_uuid)
 
+    if existing:
+        kc_write(SERVICE, existing["id"], token_json)
+        if oauth_account:
+            kc_write(OAUTH_SERVICE, existing["id"], json.dumps(oauth_account))
+        existing["subscription"] = sub or existing.get("subscription", "unknown")
+        if org_uuid:
+            existing["organization_uuid"] = org_uuid
+        if org_name:
+            existing["organization_name"] = org_name
+        existing["updated_at"] = datetime.now().isoformat()
+        save_config(cfg)
+        print(f"Updated: {format_account_label(existing)}")
+        return 0
+
+    # New account
     aid = str(uuid.uuid4())
     kc_write(SERVICE, aid, token_json)
     if oauth_account:
         kc_write(OAUTH_SERVICE, aid, json.dumps(oauth_account))
 
-    cfg["accounts"].append({
+    new_account = {
         "id": aid,
         "email": email,
         "subscription": sub or "unknown",
         "added_at": datetime.now().isoformat(),
-    })
+    }
+    if org_uuid:
+        new_account["organization_uuid"] = org_uuid
+    if org_name:
+        new_account["organization_name"] = org_name
+
+    cfg["accounts"].append(new_account)
     cfg["active_id"] = aid
     save_config(cfg)
-    print(f"Saved: {email} ({sub})")
+    print(f"Saved: {format_account_label(new_account)}")
     print(f"Total accounts: {len(cfg['accounts'])}")
     return 0
 
 
 def cmd_remove(email):
     cfg = load_config()
-    found = [a for a in cfg["accounts"] if a["email"] == email]
-    if not found:
+    matches = [a for a in cfg["accounts"] if a["email"] == email]
+    if not matches:
         print(f"Account '{email}' not found.")
         return 1
+    if len(matches) > 1:
+        print(f"Multiple accounts match '{email}' — specify which one:")
+        for a in matches:
+            print(f"  - {format_account_label(a, disambiguate=True)}")
+        print()
+        print("Edit ~/.claude/claude-code-saver/config.json directly to remove a specific one,")
+        print("or `claude auth logout` + re-run init to start fresh.")
+        return 1
+    found = matches
     kc_delete(SERVICE, found[0]["id"])
     kc_delete(OAUTH_SERVICE, found[0]["id"])
     cfg["accounts"] = [a for a in cfg["accounts"] if a["email"] != email]
@@ -395,22 +467,37 @@ def cmd_status():
     live_token = read_live_token()
     live_fp = fingerprint(live_token) if live_token else None
 
+    # If any emails are duplicated, always show org context for those rows
+    dupes = duplicate_emails(cfg)
+
+    def label_for(acct):
+        email = acct["email"]
+        org = (acct.get("organization_name") or "").strip()
+        is_default_org = org.lower().startswith(email.lower())
+        if email in dupes and org and not is_default_org:
+            return f"{email} — {org}"
+        if email in dupes and org:
+            # Still a duplicate but no distinguishing org name — show uuid prefix
+            short_org = (acct.get("organization_uuid") or "")[:8] or "default"
+            return f"{email} — org:{short_org}"
+        return email
+
     print()
-    print(f"  {'Account':<35} {'Plan':<10} {'Session':<12} {'Weekly':<12} {'Status'}")
-    print(f"  {'─'*35} {'─'*10} {'─'*12} {'─'*12} {'─'*10}")
+    print(f"  {'Account':<48} {'Plan':<8} {'Session':<10} {'Weekly':<10} {'Status'}")
+    print(f"  {'─'*48} {'─'*8} {'─'*10} {'─'*10} {'─'*10}")
 
     for acct in cfg["accounts"]:
         tok = kc_read(SERVICE, acct["id"])
-        email = acct["email"]
+        label = label_for(acct)
         sub = acct.get("subscription", "?")
 
         if not tok:
-            print(f"  {email:<35} {sub:<10} {'—':<12} {'—':<12} no token")
+            print(f"  {label:<48} {sub:<8} {'—':<10} {'—':<10} no token")
             continue
 
         at = extract_access_token(tok)
         if not at:
-            print(f"  {email:<35} {sub:<10} {'—':<12} {'—':<12} bad token")
+            print(f"  {label:<48} {sub:<8} {'—':<10} {'—':<10} bad token")
             continue
 
         is_active = live_fp and fingerprint(tok) == live_fp
@@ -419,18 +506,16 @@ def cmd_status():
         if usage and "_error" not in usage:
             s = usage.get("five_hour", {}).get("utilization", 0)
             w = usage.get("seven_day", {}).get("utilization", 0)
-            s_str = f"{s:.0f}%"
-            w_str = f"{w:.0f}%"
             reset = format_reset(usage)
             mark = "ACTIVE" if is_active else ""
-            print(f"  {email:<35} {sub:<10} {s_str:<12} {w_str:<12} {mark}")
+            print(f"  {label:<48} {sub:<8} {f'{s:.0f}%':<10} {f'{w:.0f}%':<10} {mark}")
             if reset and is_active:
-                print(f"  {'':35} {'':10} {reset}")
+                print(f"  {'':48} {'':8} {reset}")
         elif usage and usage.get("_error") == "expired":
             mark = "ACTIVE" if is_active else ""
-            print(f"  {email:<35} {sub:<10} {'expired':<12} {'—':<12} {mark}")
+            print(f"  {label:<48} {sub:<8} {'expired':<10} {'—':<10} {mark}")
         else:
-            print(f"  {email:<35} {sub:<10} {'error':<12} {'—':<12}")
+            print(f"  {label:<48} {sub:<8} {'error':<10} {'—':<10}")
 
     t = cfg.get("threshold", DEFAULT_THRESHOLD)
     print(f"\n  Auto-switch threshold: {t:.0f}%")
@@ -770,21 +855,22 @@ def cmd_login():
 
     # Show current state
     cur_oauth = read_live_oauth_account()
-    cur_email = cur_oauth.get("emailAddress") if cur_oauth else None
+    cur_email, cur_org_uuid, cur_org_name, _ = account_identity(cur_oauth)
 
     if cur_email:
-        print(f"Currently logged in as: {c(C_BOLD, cur_email)}")
-        # Before logging out, back up the current account if it's saved
         cfg = load_config()
-        for a in cfg["accounts"]:
-            if a["email"] == cur_email:
-                live_token = read_live_token()
-                if live_token:
-                    kc_write(SERVICE, a["id"], live_token)
-                if cur_oauth:
-                    kc_write(OAUTH_SERVICE, a["id"], json.dumps(cur_oauth))
-                say_ok(f"Backed up {cur_email} token")
-                break
+        existing = find_account(cfg, cur_email, cur_org_uuid)
+        if existing:
+            print(f"Currently logged in as: {c(C_BOLD, format_account_label(existing))}")
+            # Before logging out, refresh the backup with the current live token
+            live_token = read_live_token()
+            if live_token:
+                kc_write(SERVICE, existing["id"], live_token)
+            if cur_oauth:
+                kc_write(OAUTH_SERVICE, existing["id"], json.dumps(cur_oauth))
+            say_ok(f"Backed up {cur_email} token")
+        else:
+            print(f"Currently logged in as: {c(C_BOLD, cur_email)} (not yet saved)")
 
     # Step 1: Log out of Claude CLI
     print()
@@ -870,18 +956,23 @@ def cmd_init():
 
     # 3. Save current account
     cur_oauth = read_live_oauth_account()
-    cur_email = cur_oauth.get("emailAddress") if cur_oauth else None
+    cur_email, cur_org_uuid, cur_org_name, _ = account_identity(cur_oauth)
 
     cfg = load_config()
-    already_saved = any(a["email"] == cur_email for a in cfg["accounts"])
+    matched = find_account(cfg, cur_email, cur_org_uuid)
 
-    if cur_email and not already_saved:
+    if cur_email and not matched:
         print()
-        print(f"  Current Claude account: {c(C_BOLD, cur_email)}")
+        # Show org context if it's a non-personal org (helps user distinguish
+        # personal from work account when emails match)
+        if cur_org_name and not cur_org_name.lower().startswith(cur_email.lower()):
+            print(f"  Current Claude account: {c(C_BOLD, cur_email)} ({cur_org_name})")
+        else:
+            print(f"  Current Claude account: {c(C_BOLD, cur_email)}")
         if ask("  Save this account?", "y"):
             cmd_add()
-    elif cur_email and already_saved:
-        say_ok(f"{cur_email} is already saved")
+    elif matched:
+        say_ok(f"{format_account_label(matched)} is already saved")
 
     # 4. Offer to add more
     while True:
