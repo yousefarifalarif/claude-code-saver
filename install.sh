@@ -10,10 +10,8 @@
 set -euo pipefail
 
 INSTALL_DIR="$HOME/.claude/claude-code-saver"
-# Set this to the GitHub owner hosting the repo (user or org).
-# Override with CCS_URL for forks/dev — e.g. CCS_URL=https://raw.githubusercontent.com/myorg/claude-code-saver/main/claude-code-saver
-REPO_OWNER="${CCS_OWNER:-OWNER}"
-SCRIPT_URL="${CCS_URL:-https://raw.githubusercontent.com/${REPO_OWNER}/claude-code-saver/main/claude-code-saver}"
+# Override via CCS_URL for forks/dev
+SCRIPT_URL="${CCS_URL:-https://raw.githubusercontent.com/yousefarifalarif/claude-code-saver/main/claude-code-saver}"
 SCRIPT_SRC="${CCS_SRC:-}"   # path to local source (if installing from cloned repo)
 
 red() { printf '\033[31m%s\033[0m' "$*"; }

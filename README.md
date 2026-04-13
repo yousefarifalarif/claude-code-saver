@@ -9,10 +9,8 @@ Works by swapping macOS Keychain tokens + the `~/.claude.json` identity. Require
 One-liner (macOS only):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/claude-code-saver/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yousefarifalarif/claude-code-saver/main/install.sh | bash
 ```
-
-Replace `OWNER` with the GitHub owner (user or org) hosting the repo.
 
 The installer:
 
