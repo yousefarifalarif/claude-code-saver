@@ -572,9 +572,8 @@ def cmd_launch(args):
         current_worst = worst_util(current_usage)
         if current_worst is not None:
             if current_worst < threshold:
-                # Under threshold — launch with background monitor
-                # so if usage climbs mid-session, the keychain is pre-swapped
-                launch_claude(args, monitor=True)
+                # Under threshold — launch immediately
+                launch_claude(args)
             need_switch = True
         elif current_usage and current_usage.get("_error") == "expired":
             need_switch = True
@@ -638,6 +637,11 @@ def cmd_launch(args):
     candidates.sort(key=lambda x: x[2])
     best_acct, best_tok, best_worst, best_usage = candidates[0]
 
+    # Don't swap if no alternative is actually better
+    if current_worst is not None and best_worst >= current_worst:
+        print("\033[33m  All accounts are at or above current usage — launching as-is\033[0m")
+        launch_claude(args)
+
     reset_str = format_reset(best_usage)
     reset_part = f" ({reset_str})" if reset_str else ""
     print(f"\033[32m  → {best_acct['email']}: {usage_summary(best_usage)}{reset_part}\033[0m")
@@ -653,7 +657,7 @@ def cmd_launch(args):
     cfg["active_id"] = best_acct["id"]
     save_config(cfg)
 
-    launch_claude(args, monitor=True)
+    launch_claude(args)
 
 
 def cmd_threshold(val):
@@ -672,141 +676,16 @@ def cmd_threshold(val):
         return 1
 
 
-def launch_claude(args, monitor=False):
-    """Launch claude. If monitor=True, fork a background watcher that pre-swaps
-    the keychain when usage crosses the threshold — so the NEXT session starts fresh.
-    The current session is never interrupted."""
+def launch_claude(args):
+    """Replace this process with claude, passing all args through."""
     claude = find_claude_bin()
     if not claude:
         print(c(C_RED, "Claude CLI not found. Install it first: https://claude.com/claude-code"))
         sys.exit(1)
     sys.stdout.flush()
     sys.stderr.flush()
+    os.execvp(claude, [claude] + args)
 
-    if not monitor:
-        os.execvp(claude, [claude] + args)
-        return  # unreachable, but clear
-
-    # Fork: child becomes claude, parent monitors usage in background
-    pid = os.fork()
-
-    if pid == 0:
-        # ── Child: become claude (full terminal control) ────────────
-        os.execvp(claude, [claude] + args)
-    else:
-        # ── Parent: silent background monitor ───────────────────────
-        # Detach from terminal so we don't interfere with claude's TUI
-        _background_monitor(pid)
-
-# ─── Background monitor ────────────────────────────────────────────────────
-
-def _background_monitor(child_pid):
-    """Silent background process that pre-swaps keychain when usage crosses
-    threshold. Runs alongside a live Claude Code session. Never touches the
-    child process — just swaps credentials so the NEXT session starts fresh."""
-    import signal
-    import time as _time
-
-    POLL_INTERVAL = 60  # seconds between usage checks
-
-    # Ignore signals meant for the foreground process group
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
-
-    # Close stdin so we don't compete with claude for terminal input
-    try:
-        os.close(0)
-    except OSError:
-        pass
-
-    already_swapped = False
-
-    while True:
-        # Check if claude is still running
-        try:
-            wpid, status = os.waitpid(child_pid, os.WNOHANG)
-            if wpid != 0:
-                # Claude exited — we're done
-                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
-                sys.exit(exit_code)
-        except ChildProcessError:
-            sys.exit(0)
-
-        # Don't re-check if we already swapped this session
-        if not already_swapped:
-            try:
-                cfg = load_config()
-                threshold = cfg.get("threshold", DEFAULT_THRESHOLD)
-                active_id = cfg.get("active_id")
-
-                # Check active account's usage
-                live_token = read_live_token()
-                if live_token:
-                    live_access = extract_access_token(live_token)
-                    if live_access:
-                        usage = fetch_usage(live_access)
-                        worst = worst_util(usage)
-                        if worst is not None and worst >= threshold:
-                            # Over threshold — find a better account and pre-swap
-                            live_fp = fingerprint(live_token)
-                            best = _find_best_alternative(cfg, live_fp)
-                            if best:
-                                best_acct, best_tok, best_worst, best_usage = best
-                                # Backup current live token first
-                                if active_id:
-                                    kc_write(SERVICE, active_id, live_token)
-                                    live_oauth = read_live_oauth_account()
-                                    if live_oauth:
-                                        kc_write(OAUTH_SERVICE, active_id, json.dumps(live_oauth))
-
-                                # Swap keychain to the better account
-                                write_live_token(best_tok)
-                                best_oauth_json = kc_read(OAUTH_SERVICE, best_acct["id"])
-                                if best_oauth_json:
-                                    try:
-                                        write_live_oauth_account(json.loads(best_oauth_json))
-                                    except Exception:
-                                        pass
-                                cfg["active_id"] = best_acct["id"]
-                                save_config(cfg)
-                                already_swapped = True
-
-                                # macOS notification (silent, non-blocking)
-                                try:
-                                    subprocess.run([
-                                        "osascript", "-e",
-                                        f'display notification "Next session will use {best_acct["email"]} '
-                                        f'({best_worst:.0f}% used)" '
-                                        f'with title "claude-code-saver" '
-                                        f'subtitle "Pre-switched for your next session"'
-                                    ], capture_output=True, timeout=5)
-                                except Exception:
-                                    pass
-            except Exception:
-                pass  # Monitor must never crash — silent failure is OK
-
-        _time.sleep(POLL_INTERVAL)
-
-
-def _find_best_alternative(cfg, live_fp):
-    """Check all saved accounts (except the live one) and return the best candidate.
-    Returns (account, token, worst_util, usage) or None."""
-    candidates = []
-    for acct in cfg.get("accounts", []):
-        tok = kc_read(SERVICE, acct["id"])
-        if not tok or fingerprint(tok) == live_fp:
-            continue
-        at = extract_access_token(tok)
-        if not at:
-            continue
-        u = fetch_usage(at)
-        w = worst_util(u)
-        if w is not None:
-            candidates.append((acct, tok, w, u))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[2])
-    return candidates[0]
 
 # ─── Shell integration ─────────────────────────────────────────────────────
 
