@@ -15,7 +15,9 @@ Management:
   claude-code-saver add         Save the currently logged-in Claude account
   claude-code-saver remove <email>   Remove a saved account
   claude-code-saver threshold <10-99>   Set the auto-switch threshold % (default: 80)
-  claude-code-saver uninstall   Remove everything (keychain entries, config, alias)
+  claude-code-saver install-shim    Install PATH shim (works in scripts, VS Code, non-interactive shells)
+  claude-code-saver uninstall-shim  Remove the PATH shim
+  claude-code-saver uninstall   Remove everything (keychain entries, config, alias, shim)
 """
 
 import json
@@ -101,18 +103,71 @@ def ask(prompt, default="y"):
         reply = default.lower()
     return reply in ("y", "yes")
 
+# ─── Shim ──────────────────────────────────────────────────────────────────
+
+SHIM_DIR = CONFIG_DIR / "bin"
+SHIM_PATH = SHIM_DIR / "claude"
+SHIM_MARKER = "# claude-code-saver shim"
+PATHS_D_FILE = Path("/etc/paths.d/claude-code-saver")
+
+SELF_PATH = str(Path(__file__).resolve()) if __file__ else str(CONFIG_DIR / "claude-code-saver")
+
+
+def _shim_content():
+    return f"""#!/bin/sh
+{SHIM_MARKER}
+exec '{SELF_PATH}' launch "$@"
+"""
+
+
+def _is_our_shim(path_str):
+    try:
+        return SHIM_MARKER in Path(path_str).read_text()
+    except Exception:
+        return False
+
+
+def shim_installed():
+    """Return the shim location if our PATH shim is active, else None."""
+    cfg = load_config()
+    loc = cfg.get("shim_location")
+    if loc and Path(loc).exists() and _is_our_shim(loc):
+        return loc
+    return None
+
+
+def _find_versioned_claude_update(old_path):
+    """If old_path no longer exists, scan its parent dir for the latest executable."""
+    old = Path(old_path)
+    parent = old.parent
+    if not parent.exists():
+        return None
+    execs = [p for p in parent.iterdir() if p.is_file() and os.access(str(p), os.X_OK)]
+    if execs:
+        return str(max(execs, key=lambda p: p.stat().st_mtime))
+    return None
+
+
 # ─── Claude CLI discovery ──────────────────────────────────────────────────
 
 def find_claude_bin():
     """Find the claude binary. Cached in config after first detection."""
     cfg = load_config()
     cached = cfg.get("claude_bin")
-    if cached and Path(cached).exists():
-        return cached
+    if cached:
+        if Path(cached).exists() and not _is_our_shim(cached):
+            return cached
+        # Cached path gone (Claude Code updated) — scan for new version
+        if not Path(cached).exists():
+            updated = _find_versioned_claude_update(cached)
+            if updated and not _is_our_shim(updated):
+                cfg["claude_bin"] = updated
+                save_config(cfg)
+                return updated
 
-    # Try PATH first
+    # Try PATH — skip our shim and wrapper
     found = shutil.which("claude")
-    if found and not found.startswith(str(CONFIG_DIR)):  # not our wrapper
+    if found and not found.startswith(str(CONFIG_DIR)) and not _is_our_shim(found):
         return found
 
     # Fall back to common install locations
@@ -125,8 +180,11 @@ def find_claude_bin():
         f"{home}/.claude/local/claude",
     ]
     for path in candidates:
-        if Path(path).exists():
-            return path
+        p = Path(path)
+        if p.exists() and not _is_our_shim(path):
+            # Follow symlinks to get the real binary
+            real = str(p.resolve())
+            return real
     return None
 
 # ─── Keychain ───────────────────────────────────────────────────────────────
@@ -687,11 +745,176 @@ def launch_claude(args):
     os.execvp(claude, [claude] + args)
 
 
+# ─── Shim install / uninstall ──────────────────────────────────────────────
+
+def cmd_install_shim():
+    """Install a PATH shim so auto-switching works outside interactive shells.
+
+    Strategy (no sudo required):
+      1. Place the shim script at ~/.claude/claude-code-saver/bin/claude.
+      2. Redirect the real claude symlink (e.g. ~/.local/bin/claude) to point
+         to our shim.  The resolved real binary is cached in config so
+         find_claude_bin() can always reach it even if the symlink changes.
+
+    If the real claude is not a symlink (rare), we offer the /etc/paths.d/
+    approach which requires sudo once but is fully update-proof.
+    """
+    if shim_installed():
+        say_ok("PATH shim is already installed.")
+        return 0
+
+    # Discover the real binary (not from cache — we're about to set it)
+    # We need the original path in PATH and its resolved target.
+    original_link = None
+    real_binary = None
+
+    home = str(Path.home())
+    link_candidates = [
+        f"{home}/.local/bin/claude",
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        f"{home}/.npm-global/bin/claude",
+    ]
+    for path in link_candidates:
+        p = Path(path)
+        if p.exists() and not _is_our_shim(path):
+            original_link = path
+            real_binary = str(p.resolve())
+            break
+
+    # Also check PATH
+    if not original_link:
+        found = shutil.which("claude")
+        if found and not found.startswith(str(CONFIG_DIR)) and not _is_our_shim(found):
+            original_link = found
+            real_binary = str(Path(found).resolve())
+
+    if not original_link:
+        say_fail("Cannot find the real claude binary. Is Claude Code installed?")
+        return 1
+
+    say_ok(f"Found claude at: {original_link}  →  {real_binary}")
+
+    # Write our shim script to the bin dir
+    SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    SHIM_PATH.write_text(_shim_content())
+    SHIM_PATH.chmod(0o755)
+    say_ok(f"Shim written to: {SHIM_PATH}")
+
+    original_path = Path(original_link)
+    is_symlink = original_path.is_symlink()
+
+    if is_symlink:
+        # Redirect the symlink to our shim
+        original_path.unlink()
+        original_path.symlink_to(str(SHIM_PATH))
+        say_ok(f"Redirected symlink: {original_link}  →  {SHIM_PATH}")
+        install_method = "symlink"
+    else:
+        # Not a symlink — offer /etc/paths.d/ approach
+        print()
+        say_warn(f"{original_link} is a real file (not a symlink).")
+        print("  The safest approach is to add our shim dir to /etc/paths.d/ so")
+        print("  it appears in PATH for all processes including GUI apps.")
+        print(f"  This requires one sudo write to {PATHS_D_FILE}.")
+        print()
+        try:
+            answer = input("  Run sudo to add /etc/paths.d/ entry? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer in ("", "y", "yes"):
+            result = subprocess.run(
+                ["sudo", "sh", "-c", f"echo '{SHIM_DIR}' > {PATHS_D_FILE}"],
+                timeout=30,
+            )
+            if result.returncode == 0:
+                say_ok(f"Created {PATHS_D_FILE}")
+                install_method = "paths.d"
+            else:
+                say_fail("sudo failed — shim script is written but not added to PATH.")
+                print(f"  Add manually:  echo '{SHIM_DIR}' | sudo tee {PATHS_D_FILE}")
+                install_method = "partial"
+        else:
+            say_warn("Skipped. Add manually if needed:")
+            print(f"  echo '{SHIM_DIR}' | sudo tee {PATHS_D_FILE}")
+            install_method = "partial"
+
+    # Persist to config
+    cfg = load_config()
+    cfg["claude_bin"] = real_binary
+    cfg["shim_location"] = original_link if is_symlink else str(SHIM_PATH)
+    cfg["shim_method"] = install_method
+    save_config(cfg)
+
+    print()
+    if install_method in ("symlink", "paths.d"):
+        say_ok("PATH shim installed. Auto-switching now works in non-interactive shells,")
+        say_ok("VS Code tasks, Python subprocesses, and GUI app child processes.")
+        if install_method == "paths.d":
+            print(c(C_DIM, "  You may need to log out and back in for /etc/paths.d/ to take effect in GUI apps."))
+    else:
+        say_warn("Shim written but not hooked into PATH yet — see above.")
+    print()
+    return 0
+
+
+def cmd_uninstall_shim():
+    """Restore the original claude symlink and remove the shim."""
+    cfg = load_config()
+    loc = cfg.get("shim_location")
+    real_bin = cfg.get("claude_bin")
+    method = cfg.get("shim_method", "symlink")
+
+    if not loc:
+        say_warn("No shim is recorded in config.")
+        return 0
+
+    loc_path = Path(loc)
+
+    if method == "paths.d":
+        # Remove /etc/paths.d/ entry
+        if PATHS_D_FILE.exists():
+            result = subprocess.run(["sudo", "rm", str(PATHS_D_FILE)], timeout=30)
+            if result.returncode == 0:
+                say_ok(f"Removed {PATHS_D_FILE}")
+            else:
+                say_fail(f"Could not remove {PATHS_D_FILE} — remove manually with sudo")
+        # Remove shim script
+        if SHIM_PATH.exists():
+            SHIM_PATH.unlink()
+            say_ok(f"Removed shim: {SHIM_PATH}")
+    elif method == "symlink":
+        # Restore original symlink
+        if loc_path.exists() and _is_our_shim(str(loc_path)):
+            loc_path.unlink()
+        if real_bin and Path(real_bin).exists():
+            loc_path.symlink_to(real_bin)
+            say_ok(f"Restored: {loc}  →  {real_bin}")
+        else:
+            say_warn(f"Real binary not found at {real_bin} — symlink not restored.")
+            say_warn(f"Run 'claude auth login' or reinstall Claude Code if needed.")
+        # Remove shim script
+        if SHIM_PATH.exists():
+            SHIM_PATH.unlink()
+            say_ok(f"Removed shim: {SHIM_PATH}")
+    else:
+        # partial install — just clean up shim
+        if SHIM_PATH.exists():
+            SHIM_PATH.unlink()
+            say_ok(f"Removed shim: {SHIM_PATH}")
+
+    cfg.pop("shim_location", None)
+    cfg.pop("shim_method", None)
+    # Keep claude_bin in config — still useful as cache
+    save_config(cfg)
+    say_ok("PATH shim removed.")
+    return 0
+
+
 # ─── Shell integration ─────────────────────────────────────────────────────
 
 ALIAS_MARKER = "# claude-code-saver auto-switch (managed — do not edit this block)"
 ALIAS_END = "# end claude-code-saver"
-SELF_PATH = str(Path(__file__).resolve()) if __file__ else "~/.claude/claude-code-saver/claude-code-saver"
 
 
 def detect_shell_rc():
@@ -828,7 +1051,21 @@ def cmd_doctor():
     else:
         say_warn(f"Shell alias NOT installed — run 'claude-code-saver init' or add manually to {rc}")
 
-    # 8. Network (usage API reachable — we expect 401 without a token)
+    # 8. PATH shim
+    shim_loc = shim_installed()
+    if shim_loc:
+        say_ok(f"PATH shim active: {shim_loc}  →  {SHIM_PATH}")
+    else:
+        cfg2 = load_config()
+        recorded_loc = cfg2.get("shim_location")
+        if recorded_loc and not _is_our_shim(recorded_loc):
+            say_warn(f"PATH shim was installed at {recorded_loc} but was overridden (Claude Code update?)")
+            say_warn("Re-run 'claude-code-saver install-shim' to restore it")
+        else:
+            print(f"  {c(C_DIM, '○')} PATH shim not installed (optional — covers non-interactive shells)")
+            print(c(C_DIM, "    Run 'claude-code-saver install-shim' to enable"))
+
+    # 9. Network (usage API reachable — we expect 401 without a token)
     try:
         urllib.request.urlopen(USAGE_API, timeout=3)
         say_ok("Network: usage API reachable")
@@ -1019,7 +1256,21 @@ def cmd_init():
             print(f"    alias claude-code-saver='{SELF_PATH}'")
             print(f"    alias claude='{SELF_PATH} launch'")
 
-    # 6. Final summary
+    # 6. Install PATH shim (for non-interactive shells, VS Code tasks, GUI apps)
+    print()
+    if shim_installed():
+        say_ok("PATH shim already installed (works outside interactive terminals too)")
+    else:
+        print("  The PATH shim makes auto-switching work in non-interactive shells,")
+        print("  VS Code tasks, Python subprocesses, and other tools that call 'claude'")
+        print("  without going through your shell alias.")
+        print()
+        if ask("  Install PATH shim?", "y"):
+            cmd_install_shim()
+        else:
+            print(c(C_DIM, "  Skipped. Run 'claude-code-saver install-shim' anytime to add it."))
+
+    # 7. Final summary
     print()
     print("  " + "─" * 40)
     print(c(C_GREEN, c(C_BOLD, "  ✓ Setup complete!")))
@@ -1036,7 +1287,7 @@ def cmd_init():
 # ─── Uninstall ─────────────────────────────────────────────────────────────
 
 def cmd_uninstall():
-    """Remove claude-code-saver: delete keychain entries, config, and shell alias."""
+    """Remove claude-code-saver: delete keychain entries, config, alias, and shim."""
     print()
     print(c(C_BOLD, "  claude-code-saver uninstall"))
     print("  " + "─" * 40)
@@ -1045,11 +1296,16 @@ def cmd_uninstall():
     print("    • Remove all saved account backups from Keychain")
     print("    • Delete the config file")
     print("    • Remove the shell alias")
+    print("    • Remove the PATH shim (if installed)")
     print("    • Leave the script file and your live Claude login alone")
     print()
     if not ask("  Continue?", "n"):
         print("  Cancelled.")
         return 0
+
+    # Remove PATH shim first (needs config to know the shim location)
+    if shim_installed():
+        cmd_uninstall_shim()
 
     # Remove keychain entries
     cfg = load_config()
@@ -1114,6 +1370,10 @@ def main():
         return cmd_doctor()
     elif cmd == "uninstall":
         return cmd_uninstall()
+    elif cmd in ("install-shim", "install_shim"):
+        return cmd_install_shim()
+    elif cmd in ("uninstall-shim", "uninstall_shim"):
+        return cmd_uninstall_shim()
     elif cmd == "remove" and len(sys.argv) >= 3:
         return cmd_remove(sys.argv[2])
     elif cmd == "launch":
